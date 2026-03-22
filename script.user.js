@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Hide.my.IP
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.2
 // @description  Продвинутый щит конфиденциальности для стримеров с приватным, адаптивным UI. Оптимизирован от микро-миганий.
 // @author       Hide.my.IP
 // @match        *://*/*
@@ -22,7 +22,7 @@
     const HIDDEN_IP_PLACEHOLDER = "[HIDDEN]";
 
     const defaultSettings = {
-        gen: false,
+        gen: true,
         man: true,
         auto: true,
         never: false
@@ -71,7 +71,8 @@
         const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
         if (settings.gen) {
-            patterns.push("\\b\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\b");
+            patterns.push("\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b");
+            patterns.push("\\b(?:[a-fA-F0-9]{1,4}:){2,7}[a-fA-F0-9]{0,4}\\b");
         }
         if (settings.man) {
             list.forEach(item => {
@@ -90,37 +91,33 @@
     const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'TEXTAREA', 'INPUT', 'NOSCRIPT', 'HEAD', 'IFRAME']);
 
     function processNode(node) {
-        if (!activePattern) return;
+        if (!activePattern || !node) return;
 
-        const walker = document.createTreeWalker(
-            node,
-            NodeFilter.SHOW_TEXT,
-            {
-                acceptNode: function(textNode) {
-                    const parent = textNode.parentNode;
-                    if (!parent) return NodeFilter.FILTER_REJECT;
+        let textNodes =[];
 
-                    if (SKIP_TAGS.has(parent.nodeName)) return NodeFilter.FILTER_REJECT;
-                    if (parent.classList && (parent.classList.contains('h-blur') || parent.classList.contains('h-strict'))) return NodeFilter.FILTER_REJECT;
-                    if (parent.closest && parent.closest('[data-h-ignore]')) return NodeFilter.FILTER_REJECT;
-
-                    if (activePattern.test(textNode.nodeValue)) {
-                        activePattern.lastIndex = 0;
-                        return NodeFilter.FILTER_ACCEPT;
-                    }
-                    return NodeFilter.FILTER_REJECT;
-                }
+        if (node.nodeType === Node.TEXT_NODE) {
+            textNodes.push(node);
+        } else if (node.nodeType === Node.ELEMENT_NODE || node.nodeType === Node.DOCUMENT_NODE) {
+            if (SKIP_TAGS.has(node.nodeName)) return;
+            const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, null, false);
+            let currentNode;
+            while ((currentNode = walker.nextNode())) {
+                textNodes.push(currentNode);
             }
-        );
-
-        const nodesToProcess =[];
-        let currentNode;
-        while ((currentNode = walker.nextNode())) {
-            nodesToProcess.push(currentNode);
         }
 
-        for (let i = 0; i < nodesToProcess.length; i++) {
-            const textNode = nodesToProcess[i];
+        for (let i = 0; i < textNodes.length; i++) {
+            const textNode = textNodes[i];
+            const parent = textNode.parentNode;
+
+            if (!parent) continue;
+            if (SKIP_TAGS.has(parent.nodeName)) continue;
+            if (parent.classList && (parent.classList.contains('h-blur') || parent.classList.contains('h-strict'))) continue;
+            if (parent.closest && parent.closest('[data-h-ignore]')) continue;
+
+            activePattern.lastIndex = 0;
+            if (!activePattern.test(textNode.nodeValue)) continue;
+
             const text = textNode.nodeValue;
 
             if (settings.never) {
@@ -131,11 +128,12 @@
             const fragment = document.createDocumentFragment();
             let lastIndex = 0;
 
+            activePattern.lastIndex = 0;
             text.replace(activePattern, (match, _, offset) => {
                 fragment.appendChild(document.createTextNode(text.substring(lastIndex, offset)));
                 const span = document.createElement('span');
 
-                const isActuallyIP = /\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/.test(match);
+                const isActuallyIP = /\b(?:\d{1,3}\.){3}\d{1,3}\b|\b(?:[a-fA-F0-9]{1,4}:){2,7}[a-fA-F0-9]{0,4}\b/.test(match);
                 span.className = 'h-blur';
                 span.textContent = isActuallyIP ? HIDDEN_IP_PLACEHOLDER : match;
 
@@ -151,9 +149,7 @@
             });
 
             fragment.appendChild(document.createTextNode(text.substring(lastIndex)));
-            if (textNode.parentNode) {
-                textNode.parentNode.replaceChild(fragment, textNode);
-            }
+            parent.replaceChild(fragment, textNode);
         }
     }
 
@@ -168,11 +164,14 @@
                         currentIP = newIP;
                         GM_setValue('h_ip', currentIP);
                         compilePattern();
+
+                        if (document.body) {
+                            processNode(document.body);
+                        }
+
                         if (callback) callback(currentIP);
                     }
-                } catch (e) {
-                    console.error("Hide.my.IP: Failed to parse IP.", e);
-                }
+                } catch (e) {}
             }
         });
     }
@@ -182,14 +181,23 @@
             for (let i = 0; i < mutations.length; i++) {
                 const mutation = mutations[i];
                 if (mutation.type === 'childList') {
+                    let isSelfMutation = false;
                     for (let j = 0; j < mutation.addedNodes.length; j++) {
-                        const node = mutation.addedNodes[j];
-                        if (node.nodeType === Node.ELEMENT_NODE || node.nodeType === Node.TEXT_NODE) {
-                            processNode(node);
+                        const added = mutation.addedNodes[j];
+                        if (added.nodeType === Node.ELEMENT_NODE && added.classList && added.classList.contains('h-blur')) {
+                            isSelfMutation = true;
+                            break;
                         }
                     }
+                    if (isSelfMutation) continue;
+
+                    for (let j = 0; j < mutation.addedNodes.length; j++) {
+                        processNode(mutation.addedNodes[j]);
+                    }
                 } else if (mutation.type === 'characterData') {
-                    processNode(mutation.target.parentNode);
+                    const parent = mutation.target.parentNode;
+                    if (parent && parent.classList && parent.classList.contains('h-blur')) continue;
+                    processNode(parent);
                 }
             }
         });
@@ -283,12 +291,12 @@
         app.className = 'ui';
         app.setAttribute('data-h-ignore', 'true');
         app.innerHTML = `
-            <h1>Hide.my.IP <span>2.0 Turbo</span></h1>
+            <h1>Hide.my.IP <span>2.2 Turbo</span></h1>
             <div class="group-title">Protection Rules</div>
             <div class="group">
-                <div class="item"><div class="item-label">Global IP Blur<span>Hides any IPv4 address</span></div><input type="checkbox" id="g" ${settings.gen ? 'checked' : ''}></div>
-                <div class="item"><div class="item-label">Auto-detect IP<span>Hides your public IP address</span></div><input type="checkbox" id="a" ${settings.auto ? 'checked' : ''}></div>
-                <div class="item"><div class="item-label">Strict Mode (Zero-Flash)<span>Replaces IP with [HIDDEN] instantly</span></div><input type="checkbox" id="n" ${settings.never ? 'checked' : ''}></div>
+                <div class="item"><div class="item-label">Global IP Blur<span>Hides ANY IPv4 and IPv6 address</span></div><input type="checkbox" id="g" ${settings.gen ? 'checked' : ''}></div>
+                <div class="item"><div class="item-label">Auto-detect IP<span>Hides your specific public IP</span></div><input type="checkbox" id="a" ${settings.auto ? 'checked' : ''}></div>
+                <div class="item"><div class="item-label">Strict Mode (Zero-Flash)<span>Replaces IP with[HIDDEN] instantly</span></div><input type="checkbox" id="n" ${settings.never ? 'checked' : ''}></div>
                 <div class="item"><div class="item-label">Manual List<span>Hides your custom keywords</span></div><input type="checkbox" id="m" ${settings.man ? 'checked' : ''}></div>
             </div>
             <div class="group-title">Network</div>
@@ -313,6 +321,9 @@
         const syncSettings = () => {
             GM_setValue('h_settings', settings);
             compilePattern();
+            if (document.body) {
+                processNode(document.body);
+            }
         };
 
         document.getElementById('g').onchange = e => { settings.gen = e.target.checked; syncSettings(); };
@@ -353,6 +364,9 @@
                 GM_setValue('h_list', list);
                 compilePattern();
                 renderTags();
+                if (document.body) {
+                    processNode(document.body);
+                }
             }
         });
 
@@ -364,12 +378,15 @@
                 compilePattern();
                 customInput.value = '';
                 renderTags();
+                if (document.body) {
+                    processNode(document.body);
+                }
             }
         };
 
         customInput.onkeydown = e => { if (e.key === 'Enter') addToList(); };
 
- document.getElementById('r').onclick = () => {
+        document.getElementById('r').onclick = () => {
             if (confirm('This will delete all your settings and custom keywords. Are you sure?')) {
                 GM_setValue('h_list',[]);
                 GM_setValue('h_ip', '');
